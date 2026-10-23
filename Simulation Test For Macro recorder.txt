@@ -1,0 +1,137 @@
+import java.util.*;
+
+public class Main {
+
+    public static void main(String[] args) {
+        Scanner scanner = new Scanner(System.in);
+
+        // Dynamic stack stores the recorded movements.
+        Deque<Character> movementStack = new ArrayDeque<>();
+
+        // Queue stores movements in playback order.
+        List<Character> playbackList = new ArrayList<>();
+
+        // Store the time each movement was recorded.
+        List<Long> timestamps = new ArrayList<>();
+
+        System.out.println("=== Java Movement Recorder ===");
+        System.out.println("Enter movements using W, A, S, D.");
+        System.out.println("Example: WWAADDS or W A S D");
+        System.out.println("Type UNDO to remove the last movement.");
+        System.out.println("Type PLAY to replay your movements.");
+        System.out.println("Type STOP to finish.\n");
+
+        long startTime = System.currentTimeMillis();
+
+        while (scanner.hasNextLine()) {
+            System.out.print("Movements: ");
+
+            String input = scanner.nextLine()
+                    .trim()
+                    .toUpperCase();
+
+            if (input.equals("STOP")) {
+                break;
+            }
+
+            if (input.equals("PLAY")) {
+                if (movementStack.isEmpty()) {
+                    System.out.println("No movements to replay.");
+                } else {
+                    playMovements(playbackList, timestamps);
+                }
+                continue;
+            }
+
+            if (input.equals("UNDO")) {
+                if (!movementStack.isEmpty()) {
+                    char removed = movementStack.pop();
+                    playbackList.remove(playbackList.size() - 1);
+                    timestamps.remove(timestamps.size() - 1);
+
+                    System.out.println(
+                        "Removed last movement: " + removed
+                    );
+                } else {
+                    System.out.println("Nothing to undo.");
+                }
+                continue;
+            }
+
+            if (!input.matches("[WASD ]+")) {
+                System.out.println(
+                    "Invalid input. Use W, A, S, D, UNDO, PLAY, or STOP."
+                );
+                continue;
+            }
+
+            String sequence = input.replace(" ", "");
+
+            for (char movement : sequence.toCharArray()) {
+                long elapsedTime =
+                        System.currentTimeMillis() - startTime;
+
+                movementStack.push(movement);
+                playbackList.add(movement);
+                timestamps.add(elapsedTime);
+
+                System.out.println(
+                    "Recorded: " + elapsedTime + " ms: " + movement
+                );
+            }
+        }
+
+        System.out.println("\n=== Final Recorded Movements ===");
+        displayMovements(playbackList, timestamps);
+
+        System.out.println(
+            "\nTotal movements recorded: " + playbackList.size()
+        );
+
+        scanner.close();
+    }
+
+    private static void playMovements(
+            List<Character> movements,
+            List<Long> timestamps) {
+
+        System.out.println("\n=== Playing Back Movements ===");
+
+        long previousTimestamp = timestamps.get(0);
+
+        for (int i = 0; i < movements.size(); i++) {
+            long currentTimestamp = timestamps.get(i);
+            long delay = currentTimestamp - previousTimestamp;
+
+            try {
+                if (i > 0 && delay > 0) {
+                    Thread.sleep(Math.min(delay, 3000));
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.out.println("Playback interrupted.");
+                return;
+            }
+
+            System.out.println(
+                "Playback movement " + (i + 1)
+                + ": " + movements.get(i)
+            );
+
+            previousTimestamp = currentTimestamp;
+        }
+
+        System.out.println("=== Playback Complete ===\n");
+    }
+
+    private static void displayMovements(
+            List<Character> movements,
+            List<Long> timestamps) {
+
+        for (int i = 0; i < movements.size(); i++) {
+            System.out.println(
+                timestamps.get(i) + " ms: " + movements.get(i)
+            );
+        }
+    }
+}
