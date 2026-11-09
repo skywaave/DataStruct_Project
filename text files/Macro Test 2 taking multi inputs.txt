@@ -1,0 +1,65 @@
+import java.util.*;
+
+public class Main {
+
+    public static void main(String[] args) {
+        Scanner scanner = new Scanner(System.in);
+
+        List<String> movements = new ArrayList<>();
+
+        long startTime = System.currentTimeMillis();
+
+        System.out.println("=== Java Movement Recorder ===");
+        System.out.println("Enter multiple movements using W, A, S, D.");
+        System.out.println("Examples: WWAADDS or W A S D");
+        System.out.println("Type STOP to finish.\n");
+
+        while (true) {
+            System.out.print("Movements: ");
+
+            String input = scanner.nextLine()
+                    .trim()
+                    .toUpperCase();
+
+            if (input.equals("STOP")) {
+                break;
+            }
+
+            // Accept multiple movement letters and spaces.
+            if (!input.matches("[WASD ]+")) {
+                System.out.println(
+                    "Invalid input. Use W, A, S, D, or STOP."
+                );
+                continue;
+            }
+
+            // Record each movement separately.
+            String sequence = input.replace(" ", "");
+
+            for (char movement : sequence.toCharArray()) {
+
+                long elapsedTime =
+                        System.currentTimeMillis() - startTime;
+
+                String action =
+                        elapsedTime + " ms: " + movement;
+
+                movements.add(action);
+
+                System.out.println("Recorded: " + action);
+            }
+        }
+
+        System.out.println("\n=== Recorded Movements ===");
+
+        for (String movement : movements) {
+            System.out.println(movement);
+        }
+
+        System.out.println(
+            "\nTotal movements recorded: " + movements.size()
+        );
+
+        scanner.close();
+    }
+}

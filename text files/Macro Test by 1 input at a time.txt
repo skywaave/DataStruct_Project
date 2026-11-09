@@ -1,0 +1,56 @@
+import java.util.*;
+
+public class Main {
+
+    public static void main(String[] args) {
+        Scanner scanner = new Scanner(System.in);
+
+        List<String> movements = new ArrayList<>();
+
+        long startTime = System.currentTimeMillis();
+
+        System.out.println("=== Java Movement Recorder ===");
+        System.out.println("Enter W, A, S, or D to record movement.");
+        System.out.println("Type STOP to finish.\n");
+
+        while (true) {
+            System.out.print("Movement: ");
+
+            String input = scanner.nextLine()
+                    .trim()
+                    .toUpperCase();
+
+            if (input.equals("STOP")) {
+                break;
+            }
+
+            if (!input.matches("[WASD]")) {
+                System.out.println(
+                    "Invalid input. Enter W, A, S, D, or STOP."
+                );
+                continue;
+            }
+
+            long elapsedTime =
+                    System.currentTimeMillis() - startTime;
+
+            String action = elapsedTime + " ms: " + input;
+
+            movements.add(action);
+
+            System.out.println("Recorded: " + action);
+        }
+
+        System.out.println("\n=== Recorded Movements ===");
+
+        for (String movement : movements) {
+            System.out.println(movement);
+        }
+
+        System.out.println(
+            "\nTotal movements recorded: " + movements.size()
+        );
+
+        scanner.close();
+    }
+}
