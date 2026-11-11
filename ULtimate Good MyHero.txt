@@ -1,0 +1,109 @@
+        count.setText(copy.size() + " events");
+        if (copy.isEmpty()) {
+            lastAction.setText("Awaiting input");
+        } else {
+            Movement last = copy.get(copy.size() - 1);
+            lastAction.setText(last.key + (last.pressed ? " DOWN" : " UP"));
+        }
+        refreshButtons();
+    }
+
+    private void refreshButtons() {
+        boolean busy = playing.get() || recordingActive.get();
+        playButton.setEnabled(!playing.get() && !movements.isEmpty());
+        stopButton.setEnabled(playing.get() || recordingActive.get());
+        saveButton.setEnabled(!busy && !movements.isEmpty());
+        loadButton.setEnabled(!busy);
+        undoButton.setEnabled(!busy && !movements.isEmpty());
+        clearButton.setEnabled(!busy);
+        recordButton.setEnabled(!playing.get());
+    }
+
+    private void shutdown() {
+        closing = true;
+        stopPlayback.set(true);
+        if (recordingActive.get()) stopRecording();
+        music.close();
+        if (hookRegistered) {
+            try {
+                GlobalScreen.removeNativeKeyListener(this);
+                if (GlobalScreen.isNativeHookRegistered()) GlobalScreen.unregisterNativeHook();
+            } catch (NativeHookException | RuntimeException ignored) {
+                // The application is already closing; no further action is needed.
+            }
+        }
+        dispose();
+        System.exit(0);
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            Main app = new Main();
+            app.setVisible(true);
+            Timer timer = new Timer(100, e -> app.updateTimer());
+            timer.start();
+        });
+    }
+
+    /* Built-in Java Sound player. Java Sound commonly supports WAV, AIFF and AU, not MP3 by default. */
+    private static class MusicController {
+        private Clip clip;
+        private long pausedAt;
+        private boolean paused;
+
+        public void load(File file) throws Exception {
+            close();
+            try (AudioInputStream stream = AudioSystem.getAudioInputStream(file)) {
+                clip = AudioSystem.getClip();
+                clip.open(stream);
+            }
+            pausedAt = 0;
+            paused = false;
+        }
+
+        public void playOrResume() {
+            if (clip == null) return;
+            if (paused) clip.setMicrosecondPosition(pausedAt);
+            else if (!clip.isRunning() && clip.getMicrosecondPosition() >= clip.getMicrosecondLength()) {
+                clip.setMicrosecondPosition(0);
+            }
+            paused = false;
+            clip.start();
+        }
+
+        public void pause() {
+            if (clip != null && clip.isRunning()) {
+                pausedAt = clip.getMicrosecondPosition();
+                clip.stop();
+                paused = true;
+            }
+        }
+
+        public void stop() {
+            if (clip != null) {
+                clip.stop();
+                clip.setMicrosecondPosition(0);
+                pausedAt = 0;
+                paused = false;
+            }
+        }
+
+        public void setVolume(int value) {
+            if (clip == null || !clip.isControlSupported(FloatControl.Type.MASTER_GAIN)) return;
+            FloatControl control = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+            float percent = Math.max(0, Math.min(100, value)) / 100.0f;
+            float gain = percent == 0 ? control.getMinimum() : (float) (20.0 * Math.log10(percent));
+            control.setValue(Math.max(control.getMinimum(), Math.min(control.getMaximum(), gain)));
+        }
+
+        public void close() {
+            if (clip != null) {
+                clip.stop();
+                clip.close();
+                clip = null;
+            }
+            pausedAt = 0;
+            paused = false;
+        }
+    }
+}
