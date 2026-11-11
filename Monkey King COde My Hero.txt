@@ -1,0 +1,973 @@
+import com.github.kwhat.jnativehook.GlobalScreen;
+import com.github.kwhat.jnativehook.NativeHookException;
+import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent;
+import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
+
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Clip;
+import javax.sound.sampled.FloatControl;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.KeyEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.io.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public class Main extends JFrame implements NativeKeyListener {
+    private static final Color BLACK = new Color(12, 12, 17);
+    private static final Color PANEL = new Color(27, 27, 36);
+    private static final Color RED = new Color(224, 29, 45);
+    private static final Color WHITE = new Color(250, 247, 239);
+    private static final Color GOLD = new Color(255, 195, 55);
+    private static final Color GREY = new Color(165, 165, 175);
+    private static final String FILE_MAGIC = "UA_HERO_MACRO";
+    private static final int FILE_VERSION = 1;
+
+    /* ArrayList grows automatically, so this stack has no fixed event limit. */
+    private static class DynamicMovementStack {
+        private final ArrayList<Movement> items = new ArrayList<>();
+
+        public synchronized void push(Movement movement) {
+            items.add(movement);
+        }
+
+        public synchronized Movement pop() {
+            if (items.isEmpty()) return null;
+            return items.remove(items.size() - 1);
+        }
+
+        public synchronized List<Movement> snapshot() {
+            return new ArrayList<>(items);
+        }
+
+        public synchronized void replaceAll(List<Movement> movements) {
+            items.clear();
+            items.addAll(movements);
+        }
+
+        public synchronized void clear() {
+            items.clear();
+        }
+
+        public synchronized int size() {
+            return items.size();
+        }
+
+        public synchronized boolean isEmpty() {
+            return items.isEmpty();
+        }
+    }
+
+    /* Each event represents a key going down OR coming back up. */
+    private static class Movement {
+        private final int keyCode;
+        private final String key;
+        private final boolean pressed;
+        private final long elapsedNanos;
+
+        Movement(int keyCode, String key, boolean pressed, long elapsedNanos) {
+            this.keyCode = keyCode;
+            this.key = key;
+            this.pressed = pressed;
+            this.elapsedNanos = elapsedNanos;
+        }
+    }
+
+    private final DynamicMovementStack movements = new DynamicMovementStack();
+    private final Set<Integer> heldNativeKeys = new HashSet<>();
+    private final Set<Integer> playbackHeldKeys = new HashSet<>();
+    private final AtomicBoolean recordingActive = new AtomicBoolean(false);
+    private final AtomicBoolean playing = new AtomicBoolean(false);
+    private final AtomicBoolean stopPlayback = new AtomicBoolean(false);
+    private final MusicController music = new MusicController();
+
+    private final DefaultListModel<String> logModel = new DefaultListModel<>();
+    private final JList<String> activityList = new JList<>(logModel);
+    private final DefaultListModel<String> inspectorModel = new DefaultListModel<>();
+    private final JList<String> inspectorList = new JList<>(inspectorModel);
+    private final JLabel heldKeysLabel = new JLabel("NONE");
+    private final Set<Integer> inspectorHeldKeys = new HashSet<>();
+    private final JLabel status = new JLabel("STANDBY");
+    private final JLabel count = new JLabel("0 events");
+    private final JLabel lastAction = new JLabel("Awaiting input");
+    private final JLabel timerLabel = new JLabel("00:00.000");
+    private final JLabel musicStatus = new JLabel("No music loaded");
+    private final JLabel hookStatus = new JLabel("Keyboard hook: not registered");
+    private final JButton recordButton = makeButton("● START RECORDING", RED);
+    private final JButton playButton = makeButton("▶ PLAY MACRO", GOLD);
+    private final JButton stopButton = makeButton("■ STOP", PANEL);
+    private final JButton saveButton = makeButton("SAVE", PANEL);
+    private final JButton loadButton = makeButton("LOAD", PANEL);
+    private final JButton undoButton = makeButton("↶ UNDO", PANEL);
+    private final JButton clearButton = makeButton("✕ CLEAR", PANEL);
+    private final JButton chooseMusicButton = makeButton("CHOOSE MUSIC", PANEL);
+    private final JButton musicPlayButton = makeButton("▶ MUSIC", PANEL);
+    private final JButton musicPauseButton = makeButton("Ⅱ PAUSE", PANEL);
+    private final JButton musicStopButton = makeButton("■ STOP MUSIC", PANEL);
+    private final JSlider volumeSlider = new JSlider(0, 100, 70);
+    private final JCheckBox musicWithMacro = new JCheckBox("PLAY MUSIC WITH MACRO", true);
+    private final JSlider speedSlider = new JSlider(50, 200, 100);
+    private final JSpinner repeatSpinner = new JSpinner(new SpinnerNumberModel(1, 1, 50, 1));
+
+    private long recordingStart;
+    private volatile boolean closing;
+    private volatile boolean hookRegistered;
+    private volatile Thread playbackThread;
+
+    public Main() {
+        super("U.A. HERO OPERATIONS");
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
+        setSize(1450, 900);
+        setMinimumSize(new Dimension(1120, 760));
+        setLocationRelativeTo(null);
+        setContentPane(createUI());
+
+        recordButton.addActionListener(e -> toggleRecording());
+        playButton.addActionListener(e -> playMacro(true));
+        stopButton.addActionListener(e -> stopMacro());
+        saveButton.addActionListener(e -> saveMacro());
+        loadButton.addActionListener(e -> loadMacro());
+        undoButton.addActionListener(e -> undo());
+        clearButton.addActionListener(e -> clear());
+        chooseMusicButton.addActionListener(e -> chooseMusic());
+        musicPlayButton.addActionListener(e -> music.playOrResume());
+        musicPauseButton.addActionListener(e -> music.pause());
+        musicStopButton.addActionListener(e -> music.stop());
+        volumeSlider.addChangeListener(e -> music.setVolume(volumeSlider.getValue()));
+
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                shutdown();
+            }
+        });
+
+        installKeyboardHook();
+        refreshButtons();
+    }
+
+    private JPanel createUI() {
+        JPanel root = new JPanel(new BorderLayout(18, 18)) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2 = (Graphics2D) g;
+                g2.setColor(BLACK);
+                g2.fillRect(0, 0, getWidth(), getHeight());
+                g2.setColor(new Color(255, 255, 255, 12));
+                for (int x = -getHeight(); x < getWidth(); x += 25) {
+                    g2.drawLine(x, 0, x + getHeight(), getHeight());
+                }
+                g2.setColor(new Color(RED.getRed(), RED.getGreen(), RED.getBlue(), 35));
+                g2.fillPolygon(new int[]{getWidth() - 300, getWidth(), getWidth(), getWidth() - 400},
+                        new int[]{0, 0, 220, 120}, 4);
+            }
+        };
+        root.setBorder(new EmptyBorder(22, 24, 22, 24));
+        root.setOpaque(false);
+        root.add(createHeader(), BorderLayout.NORTH);
+
+        JPanel center = new JPanel(new BorderLayout(18, 0));
+        center.setOpaque(false);
+        center.add(createMainPanel(), BorderLayout.CENTER);
+        center.add(createLogPanel(), BorderLayout.EAST);
+        root.add(center, BorderLayout.CENTER);
+        root.add(createFooter(), BorderLayout.SOUTH);
+        return root;
+    }
+
+    private JPanel createHeader() {
+        JPanel header = new JPanel(new BorderLayout());
+        header.setOpaque(false);
+        JPanel titlePanel = new JPanel();
+        titlePanel.setOpaque(false);
+        titlePanel.setLayout(new BoxLayout(titlePanel, BoxLayout.Y_AXIS));
+        JLabel school = new JLabel("U.A. HIGH // HERO COURSE");
+        school.setForeground(GOLD);
+        school.setFont(new Font("Arial", Font.BOLD, 13));
+        JLabel title = new JLabel("HERO ACTION");
+        title.setForeground(WHITE);
+        title.setFont(new Font("Arial Black", Font.BOLD, 43));
+        JLabel subtitle = new JLabel("MOVEMENT MACRO // TRAINING DIVISION");
+        subtitle.setForeground(GREY);
+        subtitle.setFont(new Font("Arial", Font.BOLD, 12));
+        titlePanel.add(school);
+        titlePanel.add(title);
+        titlePanel.add(subtitle);
+
+        JPanel statusPanel = new JPanel();
+        statusPanel.setOpaque(false);
+        statusPanel.setLayout(new BoxLayout(statusPanel, BoxLayout.Y_AXIS));
+        JLabel statusTitle = new JLabel("SYSTEM STATUS");
+        statusTitle.setForeground(RED);
+        statusTitle.setFont(new Font("Arial", Font.BOLD, 12));
+        status.setForeground(WHITE);
+        status.setFont(new Font("Arial Black", Font.BOLD, 21));
+        hookStatus.setForeground(GREY);
+        hookStatus.setFont(new Font("Arial", Font.PLAIN, 11));
+        statusPanel.add(statusTitle);
+        statusPanel.add(status);
+        statusPanel.add(hookStatus);
+        header.add(titlePanel, BorderLayout.WEST);
+        header.add(statusPanel, BorderLayout.EAST);
+        return header;
+    }
+
+    private JPanel createMainPanel() {
+        JPanel main = new JPanel(new BorderLayout(0, 15));
+        main.setOpaque(false);
+        JPanel banner = new JPanel(new BorderLayout());
+        banner.setBackground(RED);
+        banner.setBorder(new EmptyBorder(13, 18, 13, 18));
+        JLabel plusUltra = new JLabel("PLUS ULTRA!");
+        plusUltra.setForeground(WHITE);
+        plusUltra.setFont(new Font("Arial Black", Font.BOLD, 28));
+        JLabel bannerText = new JLabel("CAPTURE YOUR MOVEMENT. SAVE IT. REPLAY YOUR TECHNIQUE.");
+        bannerText.setForeground(WHITE);
+        bannerText.setFont(new Font("Arial", Font.BOLD, 11));
+        banner.add(plusUltra, BorderLayout.NORTH);
+        banner.add(bannerText, BorderLayout.SOUTH);
+
+        JPanel content = new JPanel(new BorderLayout(0, 14));
+        content.setOpaque(false);
+        JPanel stats = new JPanel(new GridLayout(1, 3, 10, 0));
+        stats.setOpaque(false);
+        stats.add(statCard("TOTAL EVENTS", count));
+        stats.add(statCard("RECORDING TIMER", timerLabel));
+        stats.add(statCard("LAST MOVEMENT", lastAction));
+
+        JPanel controls = new JPanel(new BorderLayout(0, 12));
+        controls.setBackground(PANEL);
+        controls.setBorder(new EmptyBorder(17, 18, 17, 18));
+        JLabel heading = new JLabel("QUIRK CONTROL // MOVEMENT COMMANDS");
+        heading.setForeground(WHITE);
+        heading.setFont(new Font("Arial Black", Font.BOLD, 17));
+        JPanel keys = new JPanel(new GridLayout(3, 4, 9, 9));
+        keys.setOpaque(false);
+        String[][] commands = {
+                {"W", "MOVE UP"}, {"A", "MOVE LEFT"}, {"S", "MOVE DOWN"}, {"D", "MOVE RIGHT"},
+                {"W + A", "UP-LEFT DIAGONAL"}, {"W + D", "UP-RIGHT DIAGONAL"},
+                {"S + A", "DOWN-LEFT DIAGONAL"}, {"S + D", "DOWN-RIGHT DIAGONAL"},
+                {"J", "JUMP"}, {"R", "RUN"}, {"Q", "DODGE"}, {"F", "BLOCK"}
+        };
+        for (String[] command : commands) keys.add(keyCard(command[0], command[1]));
+
+        JPanel buttons = new JPanel(new GridLayout(3, 3, 8, 8));
+        buttons.setOpaque(false);
+        buttons.add(recordButton);
+        buttons.add(playButton);
+        buttons.add(stopButton);
+        buttons.add(saveButton);
+        buttons.add(loadButton);
+        buttons.add(undoButton);
+        buttons.add(clearButton);
+        buttons.add(new JLabel());
+        buttons.add(new JLabel());
+
+        JPanel playbackOptions = new JPanel(new GridLayout(2, 2, 8, 4));
+        playbackOptions.setOpaque(false);
+        JLabel speedLabel = styledLabel("PLAYBACK SPEED: " + speedSlider.getValue() + "%", GOLD);
+        speedSlider.addChangeListener(e -> speedLabel.setText("PLAYBACK SPEED: " + speedSlider.getValue() + "%"));
+        playbackOptions.add(speedLabel);
+        playbackOptions.add(speedSlider);
+        JLabel repeatLabel = styledLabel("REPEAT COUNT", GOLD);
+        playbackOptions.add(repeatLabel);
+        playbackOptions.add(repeatSpinner);
+
+        JPanel lower = new JPanel(new BorderLayout(0, 10));
+        lower.setOpaque(false);
+        lower.add(buttons, BorderLayout.NORTH);
+        lower.add(playbackOptions, BorderLayout.CENTER);
+        JLabel instructions = new JLabel("<html>Hold W+A, W+D, S+A, or S+D together for diagonal movement. "
+                + "You can also overlap movement and action keys (example: W+D+J). "
+                + "The recorder saves each key-down and key-up separately, preserving overlaps. "
+                + "F9 = record, F10 = play, F11 = emergency stop.</html>");
+        instructions.setForeground(GREY);
+        instructions.setFont(new Font("Arial", Font.PLAIN, 11));
+        lower.add(instructions, BorderLayout.SOUTH);
+        controls.add(heading, BorderLayout.NORTH);
+        controls.add(keys, BorderLayout.CENTER);
+        controls.add(lower, BorderLayout.SOUTH);
+
+        content.add(stats, BorderLayout.NORTH);
+        content.add(controls, BorderLayout.CENTER);
+        content.add(createMusicPanel(), BorderLayout.SOUTH);
+        main.add(banner, BorderLayout.NORTH);
+        main.add(content, BorderLayout.CENTER);
+        return main;
+    }
+
+    private JPanel createMusicPanel() {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBackground(PANEL);
+        panel.setBorder(new EmptyBorder(12, 15, 12, 15));
+        JLabel heading = new JLabel("HERO THEME // MUSIC PLAYER");
+        heading.setForeground(GOLD);
+        heading.setFont(new Font("Arial Black", Font.BOLD, 14));
+        JPanel top = new JPanel(new BorderLayout());
+        top.setOpaque(false);
+        top.add(heading, BorderLayout.WEST);
+        musicStatus.setForeground(GREY);
+        top.add(musicStatus, BorderLayout.EAST);
+        JPanel controls = new JPanel(new GridLayout(1, 6, 7, 0));
+        controls.setOpaque(false);
+        controls.add(chooseMusicButton);
+        controls.add(musicPlayButton);
+        controls.add(musicPauseButton);
+        controls.add(musicStopButton);
+        musicWithMacro.setOpaque(false);
+        musicWithMacro.setForeground(WHITE);
+        musicWithMacro.setFont(new Font("Arial", Font.BOLD, 10));
+        controls.add(musicWithMacro);
+        JPanel volumePanel = new JPanel(new BorderLayout());
+        volumePanel.setOpaque(false);
+        JLabel volumeLabel = styledLabel("VOLUME", WHITE);
+        volumePanel.add(volumeLabel, BorderLayout.NORTH);
+        volumeSlider.setOpaque(false);
+        volumePanel.add(volumeSlider, BorderLayout.CENTER);
+        controls.add(volumePanel);
+        panel.add(top, BorderLayout.NORTH);
+        panel.add(controls, BorderLayout.CENTER);
+        return panel;
+    }
+
+    private JPanel statCard(String heading, JLabel value) {
+        JPanel card = new JPanel(new BorderLayout(0, 7));
+        card.setBackground(PANEL);
+        card.setBorder(new EmptyBorder(11, 13, 11, 13));
+        JLabel label = styledLabel(heading, GREY);
+        value.setForeground(WHITE);
+        value.setFont(new Font("Arial Black", Font.BOLD, 17));
+        card.add(label, BorderLayout.NORTH);
+        card.add(value, BorderLayout.CENTER);
+        return card;
+    }
+
+    private JPanel keyCard(String key, String action) {
+        JPanel card = new JPanel(new BorderLayout(0, 4));
+        card.setBackground(new Color(38, 38, 49));
+        card.setBorder(BorderFactory.createLineBorder(RED, 1));
+        JLabel keyLabel = new JLabel(key, SwingConstants.CENTER);
+        keyLabel.setForeground(GOLD);
+        keyLabel.setFont(new Font("Arial Black", Font.BOLD, 27));
+        JLabel actionLabel = new JLabel(action, SwingConstants.CENTER);
+        actionLabel.setForeground(WHITE);
+        actionLabel.setFont(new Font("Arial", Font.BOLD, 10));
+        card.add(keyLabel, BorderLayout.CENTER);
+        card.add(actionLabel, BorderLayout.SOUTH);
+        return card;
+    }
+
+    private JPanel createLogPanel() {
+        JPanel panel = new JPanel(new BorderLayout(0, 10));
+        panel.setPreferredSize(new Dimension(330, 100));
+        panel.setBackground(new Color(19, 19, 26));
+        panel.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(RED, 2),
+                new EmptyBorder(13, 12, 13, 12)));
+        JLabel heading = new JLabel("HERO ACTION LOG");
+        heading.setForeground(WHITE);
+        heading.setFont(new Font("Arial Black", Font.BOLD, 19));
+        JLabel subheading = styledLabel("KEY / EVENT / ELAPSED TIME", GREY);
+        JPanel top = new JPanel(new BorderLayout());
+        top.setOpaque(false);
+        top.add(heading, BorderLayout.NORTH);
+        top.add(subheading, BorderLayout.SOUTH);
+        activityList.setBackground(new Color(19, 19, 26));
+        activityList.setForeground(WHITE);
+        activityList.setFont(new Font("Consolas", Font.PLAIN, 11));
+        activityList.setFixedCellHeight(31);
+        JScrollPane scroll = new JScrollPane(activityList);
+        scroll.setBorder(BorderFactory.createLineBorder(new Color(255, 255, 255, 40)));
+
+        JPanel inspectorPanel = new JPanel(new BorderLayout(0, 6));
+        inspectorPanel.setBackground(new Color(27, 27, 36));
+        inspectorPanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(GOLD, 1), new EmptyBorder(9, 9, 9, 9)));
+        JLabel inspectorHeading = new JLabel("LIVE KEYBOARD INSPECTOR");
+        inspectorHeading.setForeground(GOLD);
+        inspectorHeading.setFont(new Font("Arial Black", Font.BOLD, 12));
+        JLabel heldHeading = styledLabel("CURRENTLY HELD:", GREY);
+        heldKeysLabel.setForeground(WHITE);
+        heldKeysLabel.setFont(new Font("Consolas", Font.BOLD, 13));
+        JPanel heldPanel = new JPanel(new BorderLayout(5, 3));
+        heldPanel.setOpaque(false);
+        heldPanel.add(heldHeading, BorderLayout.NORTH);
+        heldPanel.add(heldKeysLabel, BorderLayout.CENTER);
+        inspectorList.setBackground(new Color(19, 19, 26));
+        inspectorList.setForeground(WHITE);
+        inspectorList.setFont(new Font("Consolas", Font.PLAIN, 10));
+        inspectorList.setFixedCellHeight(20);
+        JScrollPane inspectorScroll = new JScrollPane(inspectorList);
+        inspectorScroll.setPreferredSize(new Dimension(280, 105));
+        inspectorScroll.setBorder(BorderFactory.createLineBorder(new Color(255, 255, 255, 35)));
+        JPanel inspectorTop = new JPanel(new BorderLayout(0, 5));
+        inspectorTop.setOpaque(false);
+        inspectorTop.add(inspectorHeading, BorderLayout.NORTH);
+        inspectorTop.add(heldPanel, BorderLayout.SOUTH);
+        inspectorPanel.add(inspectorTop, BorderLayout.NORTH);
+        inspectorPanel.add(inspectorScroll, BorderLayout.CENTER);
+
+        panel.add(top, BorderLayout.NORTH);
+        panel.add(scroll, BorderLayout.CENTER);
+        panel.add(inspectorPanel, BorderLayout.SOUTH);
+        return panel;
+    }
+
+    private JPanel createFooter() {
+        JPanel footer = new JPanel(new BorderLayout());
+        footer.setOpaque(false);
+        JLabel left = styledLabel("U.A. HERO SUPPORT DIVISION", GREY);
+        JLabel right = styledLabel("F9 RECORD  //  F10 PLAY  //  F11 STOP", GOLD);
+        footer.add(left, BorderLayout.WEST);
+        footer.add(right, BorderLayout.EAST);
+        return footer;
+    }
+
+    private JLabel styledLabel(String text, Color color) {
+        JLabel label = new JLabel(text);
+        label.setForeground(color);
+        label.setFont(new Font("Arial", Font.BOLD, 11));
+        return label;
+    }
+
+    private static JButton makeButton(String text, Color color) {
+        JButton button = new JButton(text);
+        button.setBackground(color);
+        button.setForeground(WHITE);
+        button.setFont(new Font("Arial Black", Font.BOLD, 11));
+        button.setFocusPainted(false);
+        button.setBorder(new EmptyBorder(12, 8, 12, 8));
+        button.setOpaque(true);
+        button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return button;
+    }
+
+    private void installKeyboardHook() {
+        Logger.getLogger(GlobalScreen.class.getPackage().getName()).setLevel(Level.OFF);
+        try {
+            if (!GlobalScreen.isNativeHookRegistered()) GlobalScreen.registerNativeHook();
+            GlobalScreen.addNativeKeyListener(this);
+            hookRegistered = true;
+            hookStatus.setText("Keyboard hook: registered");
+        } catch (NativeHookException | RuntimeException ex) {
+            hookRegistered = false;
+            hookStatus.setText("Keyboard hook: ERROR");
+            JOptionPane.showMessageDialog(this, "Keyboard capture could not start:\n" + ex.getMessage(),
+                    "Keyboard Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private String getKey(int code) {
+        switch (code) {
+            case NativeKeyEvent.VC_W: return "W";
+            case NativeKeyEvent.VC_A: return "A";
+            case NativeKeyEvent.VC_S: return "S";
+            case NativeKeyEvent.VC_D: return "D";
+            case NativeKeyEvent.VC_J: return "J";
+            case NativeKeyEvent.VC_R: return "R";
+            case NativeKeyEvent.VC_Q: return "Q";
+            case NativeKeyEvent.VC_F: return "F";
+            default: return "";
+        }
+    }
+
+    private int awtKeyCode(String key) {
+        switch (key) {
+            case "W": return KeyEvent.VK_W;
+            case "A": return KeyEvent.VK_A;
+            case "S": return KeyEvent.VK_S;
+            case "D": return KeyEvent.VK_D;
+            case "J": return KeyEvent.VK_J;
+            case "R": return KeyEvent.VK_R;
+            case "Q": return KeyEvent.VK_Q;
+            case "F": return KeyEvent.VK_F;
+            default: return KeyEvent.VK_UNDEFINED;
+        }
+    }
+
+    private String actionName(String key) {
+        switch (key) {
+            case "W": return "MOVE UP";
+            case "A": return "MOVE LEFT";
+            case "S": return "MOVE DOWN";
+            case "D": return "MOVE RIGHT";
+            case "J": return "JUMP";
+            case "R": return "RUN";
+            case "Q": return "DODGE";
+            case "F": return "BLOCK";
+            default: return "UNKNOWN";
+        }
+    }
+
+    @Override
+    public void nativeKeyPressed(NativeKeyEvent event) {
+        int code = event.getKeyCode();
+        if (code == NativeKeyEvent.VC_F9) {
+            SwingUtilities.invokeLater(this::toggleRecording);
+            return;
+        }
+        if (code == NativeKeyEvent.VC_F10) {
+            SwingUtilities.invokeLater(() -> playMacro(false));
+            return;
+        }
+        if (code == NativeKeyEvent.VC_F11) {
+            SwingUtilities.invokeLater(this::stopMacro);
+            return;
+        }
+        String key = getKey(code);
+        if (key.isEmpty()) return;
+        boolean firstPress;
+        synchronized (inspectorHeldKeys) {
+            firstPress = inspectorHeldKeys.add(code);
+        }
+        if (firstPress) updateKeyboardInspector(key, true);
+        if (!recordingActive.get()) return;
+        synchronized (heldNativeKeys) {
+            if (!heldNativeKeys.add(code)) return;
+        }
+        addMovement(new Movement(awtKeyCode(key), key, true, System.nanoTime() - recordingStart));
+    }
+
+    @Override
+    public void nativeKeyReleased(NativeKeyEvent event) {
+        int code = event.getKeyCode();
+        String key = getKey(code);
+        if (key.isEmpty()) return;
+        boolean wasInspectorHeld;
+        synchronized (inspectorHeldKeys) {
+            wasInspectorHeld = inspectorHeldKeys.remove(code);
+        }
+        if (wasInspectorHeld) updateKeyboardInspector(key, false);
+        boolean wasHeld;
+        synchronized (heldNativeKeys) {
+            wasHeld = heldNativeKeys.remove(code);
+        }
+        if (wasHeld && recordingActive.get()) {
+            addMovement(new Movement(awtKeyCode(key), key, false, System.nanoTime() - recordingStart));
+        }
+    }
+
+    @Override
+    public void nativeKeyTyped(NativeKeyEvent event) { }
+
+    private void updateKeyboardInspector(String key, boolean pressed) {
+        SwingUtilities.invokeLater(() -> {
+            List<String> held = new ArrayList<>();
+            synchronized (inspectorHeldKeys) {
+                for (int code : inspectorHeldKeys) held.add(getKey(code));
+            }
+            java.util.Collections.sort(held);
+            heldKeysLabel.setText(describeHeldCombo(held));
+
+            String event = String.format("%-2s  %s  %s", key,
+                    pressed ? "PRESSED " : "RELEASED", recordingActive.get() ? "RECORDING" : "MONITORING");
+            inspectorModel.addElement(event);
+            while (inspectorModel.size() > 100) inspectorModel.remove(0);
+            inspectorList.ensureIndexIsVisible(inspectorModel.size() - 1);
+        });
+    }
+
+
+    private String describeHeldCombo(List<String> held) {
+        if (held.isEmpty()) return "NONE";
+
+        boolean up = held.contains("W");
+        boolean left = held.contains("A");
+        boolean down = held.contains("S");
+        boolean right = held.contains("D");
+
+        String direction = "";
+        if (up && left) direction = "UP-LEFT";
+        else if (up && right) direction = "UP-RIGHT";
+        else if (down && left) direction = "DOWN-LEFT";
+        else if (down && right) direction = "DOWN-RIGHT";
+        else if (up) direction = "UP";
+        else if (down) direction = "DOWN";
+        else if (left) direction = "LEFT";
+        else if (right) direction = "RIGHT";
+
+        List<String> actions = new ArrayList<>();
+        if (held.contains("J")) actions.add("JUMP");
+        if (held.contains("R")) actions.add("RUN");
+        if (held.contains("Q")) actions.add("DODGE");
+        if (held.contains("F")) actions.add("BLOCK");
+
+        String result = String.join(" + ", held);
+        if (!direction.isEmpty()) result += "  |  " + direction;
+        if (!actions.isEmpty()) result += " + " + String.join(" + ", actions);
+        return result;
+    }
+
+    private void addMovement(Movement movement) {
+        movements.push(movement);
+        SwingUtilities.invokeLater(() -> {
+            addLogLine(movement);
+            count.setText(movements.size() + " events");
+            lastAction.setText(movement.key + (movement.pressed ? " DOWN" : " UP"));
+            refreshButtons();
+        });
+    }
+
+    private void addLogLine(Movement movement) {
+        long millis = movement.elapsedNanos / 1_000_000;
+        String event = movement.pressed ? "KEY DOWN" : "KEY UP";
+        logModel.addElement(String.format("%-2s  %-8s  %02d:%02d.%03d", movement.key, event,
+                millis / 60000, (millis / 1000) % 60, millis % 1000));
+        activityList.ensureIndexIsVisible(logModel.size() - 1);
+        updateTimer();
+    }
+
+    private void toggleRecording() {
+        if (playing.get()) return;
+        if (recordingActive.get()) {
+            stopRecording();
+        } else {
+            synchronized (heldNativeKeys) { heldNativeKeys.clear(); }
+            recordingStart = System.nanoTime();
+            recordingActive.set(true);
+            status.setText("RECORDING");
+            recordButton.setText("■ STOP RECORDING");
+            recordButton.setBackground(new Color(130, 20, 30));
+        }
+        refreshButtons();
+    }
+
+    private void stopRecording() {
+        recordingActive.set(false);
+        long elapsed = System.nanoTime() - recordingStart;
+        List<Integer> keysToRelease = new ArrayList<>();
+        synchronized (heldNativeKeys) {
+            keysToRelease.addAll(heldNativeKeys);
+            heldNativeKeys.clear();
+        }
+        for (int nativeCode : keysToRelease) {
+            String key = getKey(nativeCode);
+            if (!key.isEmpty()) addMovement(new Movement(awtKeyCode(key), key, false, elapsed));
+        }
+        status.setText("STANDBY");
+        recordButton.setText("● START RECORDING");
+        recordButton.setBackground(RED);
+        refreshButtons();
+    }
+
+    private void updateTimer() {
+        if (!recordingActive.get()) return;
+        long elapsed = (System.nanoTime() - recordingStart) / 1_000_000;
+        timerLabel.setText(String.format("%02d:%02d.%03d", elapsed / 60000,
+                (elapsed / 1000) % 60, elapsed % 1000));
+    }
+
+    private void playMacro(boolean countdown) {
+        if (recordingActive.get()) stopRecording();
+        if (!playing.compareAndSet(false, true)) return;
+        List<Movement> copy = movements.snapshot();
+        if (copy.isEmpty()) {
+            playing.set(false);
+            JOptionPane.showMessageDialog(this, "Record or load movements first.");
+            refreshButtons();
+            return;
+        }
+        stopPlayback.set(false);
+        status.setText("PLAYING");
+        refreshButtons();
+        final int repeats = (Integer) repeatSpinner.getValue();
+        final double speed = speedSlider.getValue() / 100.0;
+        final boolean startMusic = musicWithMacro.isSelected();
+        playbackThread = new Thread(() -> runPlayback(copy, countdown, repeats, speed, startMusic), "HeroMacroPlayback");
+        playbackThread.setDaemon(true);
+        playbackThread.start();
+    }
+
+    private void runPlayback(List<Movement> copy, boolean countdown, int repeats, double speed, boolean startMusic) {
+        Robot robot = null;
+        try {
+            if (countdown) {
+                for (int i = 3; i > 0 && !closing && !stopPlayback.get(); i--) {
+                    final int seconds = i;
+                    SwingUtilities.invokeLater(() -> status.setText("SWITCH IN " + seconds));
+                    Thread.sleep(1000);
+                }
+            }
+            robot = new Robot();
+            if (startMusic) SwingUtilities.invokeLater(music::playOrResume);
+            for (int pass = 0; pass < repeats && !closing && !stopPlayback.get(); pass++) {
+                long previous = 0;
+                for (Movement movement : copy) {
+                    if (closing || stopPlayback.get()) break;
+                    long delay = movement.elapsedNanos - previous;
+                    if (delay > 0) sleepNanos((long) (delay / speed));
+                    if (closing || stopPlayback.get()) break;
+                    if (movement.pressed) {
+                        robot.keyPress(movement.keyCode);
+                        synchronized (playbackHeldKeys) { playbackHeldKeys.add(movement.keyCode); }
+                    } else {
+                        robot.keyRelease(movement.keyCode);
+                        synchronized (playbackHeldKeys) { playbackHeldKeys.remove(movement.keyCode); }
+                    }
+                    previous = movement.elapsedNanos;
+                }
+                releasePlaybackKeys(robot);
+            }
+        } catch (Exception ex) {
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
+                    "Playback error: " + ex.getMessage(), "Playback Error", JOptionPane.ERROR_MESSAGE));
+        } finally {
+            if (robot != null) releasePlaybackKeys(robot);
+            if (startMusic) SwingUtilities.invokeLater(music::stop);
+            playing.set(false);
+            playbackThread = null;
+            SwingUtilities.invokeLater(() -> {
+                status.setText("STANDBY");
+                refreshButtons();
+            });
+        }
+    }
+
+    private void sleepNanos(long nanos) throws InterruptedException {
+        long end = System.nanoTime() + nanos;
+        while (!closing && !stopPlayback.get()) {
+            long remaining = end - System.nanoTime();
+            if (remaining <= 0) return;
+            long chunk = Math.min(remaining, 25_000_000L);
+            long millis = chunk / 1_000_000;
+            int extraNanos = (int) (chunk % 1_000_000);
+            Thread.sleep(millis, extraNanos);
+        }
+    }
+
+    private void releasePlaybackKeys(Robot robot) {
+        synchronized (playbackHeldKeys) {
+            for (int keyCode : playbackHeldKeys) robot.keyRelease(keyCode);
+            playbackHeldKeys.clear();
+        }
+    }
+
+    private void stopMacro() {
+        boolean wasPlaying = playing.get();
+        boolean wasRecording = recordingActive.get();
+        if (!wasPlaying && !wasRecording) return;
+        stopPlayback.set(true);
+        if (wasRecording) stopRecording();
+        if (wasPlaying) status.setText("STOPPING");
+        refreshButtons();
+    }
+
+    private void saveMacro() {
+        if (recordingActive.get() || playing.get()) {
+            JOptionPane.showMessageDialog(this, "Stop recording and playback before saving.");
+            return;
+        }
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Save Hero Macro");
+        chooser.setSelectedFile(new File("hero-macro.ham"));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        File file = chooser.getSelectedFile();
+        if (!file.getName().toLowerCase().endsWith(".ham")) file = new File(file.getParentFile(), file.getName() + ".ham");
+        List<Movement> copy = movements.snapshot();
+        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)))) {
+            out.writeUTF(FILE_MAGIC);
+            out.writeInt(FILE_VERSION);
+            out.writeInt(copy.size());
+            for (Movement movement : copy) {
+                out.writeInt(movement.keyCode);
+                out.writeUTF(movement.key);
+                out.writeBoolean(movement.pressed);
+                out.writeLong(movement.elapsedNanos);
+            }
+            JOptionPane.showMessageDialog(this, "Saved " + copy.size() + " events to:\n" + file.getAbsolutePath());
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "Could not save macro: " + ex.getMessage(), "Save Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void loadMacro() {
+        if (recordingActive.get() || playing.get()) {
+            JOptionPane.showMessageDialog(this, "Stop recording and playback before loading.");
+            return;
+        }
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Load Hero Macro");
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        File file = chooser.getSelectedFile();
+        List<Movement> loaded = new ArrayList<>();
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+            String magic = in.readUTF();
+            int version = in.readInt();
+            int amount = in.readInt();
+            if (!FILE_MAGIC.equals(magic) || version != FILE_VERSION || amount < 0 || amount > 2_000_000) {
+                throw new IOException("This is not a supported Hero Macro file.");
+            }
+            long previousTime = -1;
+            for (int i = 0; i < amount; i++) {
+                int keyCode = in.readInt();
+                String key = in.readUTF();
+                boolean pressed = in.readBoolean();
+                long elapsed = in.readLong();
+                if (awtKeyCode(key) == KeyEvent.VK_UNDEFINED || awtKeyCode(key) != keyCode
+                        || elapsed < previousTime || elapsed < 0) {
+                    throw new IOException("The macro contains invalid movement data.");
+                }
+                loaded.add(new Movement(keyCode, key, pressed, elapsed));
+                previousTime = elapsed;
+            }
+            movements.replaceAll(loaded);
+            rebuildLog();
+            JOptionPane.showMessageDialog(this, "Loaded " + loaded.size() + " events from:\n" + file.getAbsolutePath());
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "Could not load macro: " + ex.getMessage(), "Load Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void chooseMusic() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Choose Music (WAV, AIFF, or AU)");
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        try {
+            music.load(chooser.getSelectedFile());
+            musicStatus.setText(chooser.getSelectedFile().getName());
+            music.setVolume(volumeSlider.getValue());
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Could not load audio. Use WAV, AIFF, or AU.\n" + ex.getMessage(),
+                    "Music Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
+    private void undo() {
+        if (playing.get() || recordingActive.get()) return;
+        movements.pop();
+        rebuildLog();
+    }
+
+    private void clear() {
+        if (recordingActive.get() || playing.get()) {
+            JOptionPane.showMessageDialog(this, "Stop recording and playback first.");
+            return;
+        }
+        movements.clear();
+        rebuildLog();
+        timerLabel.setText("00:00.000");
+        lastAction.setText("Awaiting input");
+    }
+
+    private void rebuildLog() {
+        logModel.clear();
+        List<Movement> copy = movements.snapshot();
+        for (Movement movement : copy) addLogLine(movement);
+        count.setText(copy.size() + " events");
+        if (copy.isEmpty()) {
+            lastAction.setText("Awaiting input");
+        } else {
+            Movement last = copy.get(copy.size() - 1);
+            lastAction.setText(last.key + (last.pressed ? " DOWN" : " UP"));
+        }
+        refreshButtons();
+    }
+
+    private void refreshButtons() {
+        boolean busy = playing.get() || recordingActive.get();
+        playButton.setEnabled(!playing.get() && !movements.isEmpty());
+        stopButton.setEnabled(playing.get() || recordingActive.get());
+        saveButton.setEnabled(!busy && !movements.isEmpty());
+        loadButton.setEnabled(!busy);
+        undoButton.setEnabled(!busy && !movements.isEmpty());
+        clearButton.setEnabled(!busy);
+        recordButton.setEnabled(!playing.get());
+    }
+
+    private void shutdown() {
+        closing = true;
+        stopPlayback.set(true);
+        if (recordingActive.get()) stopRecording();
+        music.close();
+        if (hookRegistered) {
+            try {
+                GlobalScreen.removeNativeKeyListener(this);
+                if (GlobalScreen.isNativeHookRegistered()) GlobalScreen.unregisterNativeHook();
+            } catch (NativeHookException | RuntimeException ignored) {
+                // The application is already closing; no further action is needed.
+            }
+        }
+        dispose();
+        System.exit(0);
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> {
+            Main app = new Main();
+            app.setVisible(true);
+            Timer timer = new Timer(100, e -> app.updateTimer());
+            timer.start();
+        });
+    }
+
+    /* Built-in Java Sound player. Java Sound commonly supports WAV, AIFF and AU, not MP3 by default. */
+    private static class MusicController {
+        private Clip clip;
+        private long pausedAt;
+        private boolean paused;
+
+        public void load(File file) throws Exception {
+            close();
+            try (AudioInputStream stream = AudioSystem.getAudioInputStream(file)) {
+                clip = AudioSystem.getClip();
+                clip.open(stream);
+            }
+            pausedAt = 0;
+            paused = false;
+        }
+
+        public void playOrResume() {
+            if (clip == null) return;
+            if (paused) clip.setMicrosecondPosition(pausedAt);
+            else if (!clip.isRunning() && clip.getMicrosecondPosition() >= clip.getMicrosecondLength()) {
+                clip.setMicrosecondPosition(0);
+            }
+            paused = false;
+            clip.start();
+        }
+
+        public void pause() {
+            if (clip != null && clip.isRunning()) {
+                pausedAt = clip.getMicrosecondPosition();
+                clip.stop();
+                paused = true;
+            }
+        }
+
+        public void stop() {
+            if (clip != null) {
+                clip.stop();
+                clip.setMicrosecondPosition(0);
+                pausedAt = 0;
+                paused = false;
+            }
+        }
+
+        public void setVolume(int value) {
+            if (clip == null || !clip.isControlSupported(FloatControl.Type.MASTER_GAIN)) return;
+            FloatControl control = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+            float percent = Math.max(0, Math.min(100, value)) / 100.0f;
+            float gain = percent == 0 ? control.getMinimum() : (float) (20.0 * Math.log10(percent));
+            control.setValue(Math.max(control.getMinimum(), Math.min(control.getMaximum(), gain)));
+        }
+
+        public void close() {
+            if (clip != null) {
+                clip.stop();
+                clip.close();
+                clip = null;
+            }
+            pausedAt = 0;
+            paused = false;
+        }
+    }
+}
